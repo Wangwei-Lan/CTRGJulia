@@ -1,0 +1,179 @@
+include("../2DClassical/partition.jl")
+using TensorOperations
+using LinearAlgebra
+using Arpack
+using PrefileView
+using Profile
+
+
+#--- Debug Parameter
+
+
+#------- function ordered eigen value decomposition
+function eigenorder(A::Array{Float64})
+    F = eigen(A)
+    order = sortperm(F.values,rev=true,by=abs)
+    return F.vectors[:,order],F.values[order]
+end
+
+function HMover(T::Array{Float64},A::Array{Float64},chimax;Asz=nothing)
+    #------  construct Projector based on higher order svd (more details should refer to arxiv.1201.1144)
+    @tensor TEMP[-1,-2,-3,-4,-5,-6] := T[-1,-3,-4,1]*A[-2,1,-5,-6]
+    chiAup = size(A,1); chiAright = size(A,4)
+    chiTup = size(T,1); chiTleft = size(T,2)
+    TEMP = reshape(TEMP,chiAup*chiTup,chiAup*chiTup*chiTleft*chiAright)
+    TEMP = TEMP*TEMP'
+    eigvectors,eigvalues = eigenorder(TEMP)
+    ProjectorUp = eigvectors
+    #----- Projector
+    if size(ProjectorUp,2) > chimax
+        ProjectorUp = reshape(ProjectorUp[:,1:chimax],chiTup,chiAup,chimax)
+    else
+        ProjectorUp = reshape(ProjectorUp,chiTup,chiAup,chiTup*chiAup)
+    end
+    #----- Update A tensor
+    if Asz == nothing
+        @tensor A[-1,-2,-3,-4] := T[2,-2,4,3]*A[1,3,5,-4]*ProjectorUp[2,1,-1]*ProjectorUp[4,5,-3]
+        return A,ProjectorUp
+    else
+        #  Asz is Numerator
+        if size(Asz,1) == size(ProjectorUp,1)                                # This if deal with Left and Right mover
+            @tensor Asz[-1,-2,-3,-4] := Asz[2,-2,4,3]*A[1,3,5,-4]*ProjectorUp[2,1,-1]*ProjectorUp[4,5,-3]
+        else
+            @tensor Asz[-1,-2,-3,-4] := T[2,-2,4,3]*Asz[1,3,5,-4]*ProjectorUp[2,1,-1]*ProjectorUp[4,5,-3]
+        end
+        # update A, which is Denominator , should rename to denominator
+        @tensor A[-1,-2,-3,-4] := T[2,-2,4,3]*A[1,3,5,-4]*ProjectorUp[2,1,-1]*ProjectorUp[4,5,-3]
+        return A,Asz,ProjectorUp
+    end
+end
+
+function VMover(T::Array{Float64},A::Array{Float64},chimax::Int64;Asz = nothing)
+    A = permutedims(A,[2,3,4,1])
+    T = permutedims(T,[2,3,4,1])
+    if Asz == nothing
+        A,PV = HMover(T,A,chimax)
+        return permutedims(A,[4,1,2,3]),PV
+    else
+        Asz = permutedims(Asz,[2,3,4,1])
+        A,Asz,PV = HMover(T,A,chimax,Asz=Asz)
+        return permutedims(A,[4,1,2,3]),permutedims(Asz,[4,1,2,3]),PV
+    end
+end
+
+
+function CorseGraining(T::Array{Float64},NumLayer::Int64;Sz=Float64[1.0 0.0; 0.0 -1.0])
+    HT = T; VT = T
+    CenterDenominator = T
+    @tensor CenterNumerator[-1,-2,-3,-4] := T[-1,-2,1,-4]*Sz[1,-3]  # Used to compute Expectation value!
+    NormLayer = Array{Float64}(undef,0)
+    HTnorm = Array{Float64}(undef,0)
+    VTnorm = Array{Float64}(undef,0)
+    for j in 1:NumLayer
+        j%1000 == 0 ? println("This is Loop $j") : ()
+        htnorm = maximum(HT);append!(HTnorm,[htnorm])
+        HT = HT/maximum(HT)
+        #------ Left Mover
+        CenterDenominator,CenterNumerator,PL = HMover(HT,CenterDenominator,chimax,Asz=CenterNumerator)
+        @tensor VT[-1,-2,-3,-4] := VT[1,3,5,-4]*T[2,-2,4,3]*PL[2,1,-1]*PL[4,5,-3]
+
+
+        #------ Right Mover
+        CenterDenominator,CenterNumerator,PR = HMover(CenterDenominator,HT,chimax,Asz=CenterNumerator)
+        @tensor VT[-1,-2,-3,-4] := VT[2,-2,4,3]*T[1,3,5,-4]*PR[2,1,-1]*PR[4,5,-3]
+
+
+        vtnorm = maximum(VT);append!(VTnorm,[vtnorm])
+        VT = VT/maximum(VT)
+
+        #------ Up Mover
+        CenterDenominator,CenterNumerator,PD = VMover(VT,CenterDenominator,chimax,Asz=CenterNumerator)
+        @tensor HT[-1,-2,-3,-4] := HT[-1,1,3,4]*T[3,2,-3,5]*PD[2,1,-2]*PD[5,4,-4]
+
+        #------ Down Mover
+        CenterDenominator,CenterNumerator,PU = VMover(CenterDenominator,VT,chimax,Asz=CenterNumerator)
+        @tensor HT[-1,-2,-3,-4] := HT[3,2,-3,5]*T[-1,1,3,4]*PU[2,1,-2]*PU[5,4,-4]
+
+        append!(NormLayer,[maximum(CenterDenominator)*htnorm^2*vtnorm^2])
+        CenterNumerator = CenterNumerator/maximum(CenterDenominator)
+        CenterDenominator = CenterDenominator/maximum(CenterDenominator)
+    end
+
+    return CenterDenominator,CenterNumerator,NormLayer,HT,VT
+
+end
+
+
+#-----  Set Parameter
+Dlink = 2
+chimax = 20
+sx = Float64[0.0 1.0;
+            1.0  0.0]
+sz = Float64[1.0 0.0;1
+            0.0  -1.0]
+
+
+#---- Base Tensor
+
+
+#T= 1.0;Beta =  1/T #log(1+sqrt(2))/2
+MagExact = Array{Float64}(undef,0)
+MagTree = Array{Float64}(undef,0)
+MagTest = Array{Float64}(undef,0)
+InternalEnergyTree = Array{Float64}(undef,0)
+InternalEnergyExact = Array{Float64}(undef,0)
+
+for Beta in 0.1:0.05:1.00
+#Temperature = 2.26
+#Beta = 1/Temperature
+    #=
+    E0=0.0;
+    T= zeros(Dlink,Dlink,Dlink,Dlink)
+    T = T .+ exp(-(0-E0)*Beta)
+    T[1,1,1,1]=T[2,2,2,2]= exp(-(4-E0)*Beta)
+    T[1,2,1,2]=T[2,1,2,1]= exp(-(-4-E0)*Beta)
+    @tensor Tsx[-1,-2,-3,-4] := T[-1,-2,1,-4]*sx[1,-3]
+    @tensor Tsz[-1,-2,-3,-4] := T[-1,-2,1,-4]*sz[1,-3]
+    =#
+
+    #----- Base Tensor Test from 2D
+    #
+    Q = Float64[exp(Beta) exp(-Beta);
+                exp(-Beta) exp(Beta)]
+    g = zeros(Dlink,Dlink,Dlink,Dlink)
+    g[1,1,1,1] = g[2,2,2,2] = 1
+    gp = zeros(Dlink,Dlink,Dlink,Dlink)
+    gp[1,1,1,1] = -1;gp[2,2,2,2] = 1
+    @tensor T[-1,-2,-3,-4] := sqrt(Q)[-1,1]*sqrt(Q)[-2,2]*sqrt(Q)[-3,3]*sqrt(Q)[-4,4]*g[1,2,3,4]
+    @tensor Tsx[-1,-2,-3,-4] := sqrt(Q)[-1,1]*sqrt(Q)[-2,2]*sqrt(Q)[-3,3]*sqrt(Q)[-4,4]*gp[1,2,3,4]
+    #
+    FEconverge = Array{Float64}(undef,0)
+    feconverge = Array{Float64}(undef,0)
+    #for NumLayer in 100:100:100
+        NumLayer = 200
+        Ns = 1+8*sum(1:1:NumLayer)
+        rhoDenominator,rhoNumerator,NormLayer,HT,VT = CorseGraining(T,NumLayer,Sz=sx)
+        Z = tr(reshape(rhoDenominator,size(rhoDenominator,1)^2,size(rhoDenominator,1)^2))
+        ZZ = tr(reshape(rhoNumerator,size(rhoDenominator,1)^2,size(rhoDenominator,1)^2))
+        #FE1 = log(Z)/Ns
+        #FE2 = (log(Z)+sum(log.(NormLayer)))/Ns
+        #append!(FEconverge,[FE])
+    #end
+    #exact = (1-sinh(2*Beta)^(-4))^(1/8)
+    #append!(MagExact,[exact])
+
+    @tensor Numerator[] := Tsx[3,11,1,4]*T[17,10,13,11]*T[2,18,3,7]*T[16,15,17,18]*
+                                rhoDenominator[6,5,8,12]*VT[9,4,6,10]*VT[8,7,9,15]*HT[1,14,2,5]*HT[13,12,16,14]
+    @tensor Denominator[] := T[3,11,1,4]*T[17,10,13,11]*T[2,18,3,7]*T[16,15,17,18]*
+                                rhoDenominator[6,5,8,12]*VT[9,4,6,10]*VT[8,7,9,15]*HT[1,14,2,5]*HT[13,12,16,14]
+    append!(MagTree,[Numerator[1]/Denominator[1]])
+
+    @tensor EnergyNumerator[] := Tsx[17,3,4,1]*Tsx[4,9,10,5]*T[24,2,8,3]*T[8,7,14,9]*T[16,23,17,18]*T[22,21,24,23]*
+                        VT[20,1,6,2]*VT[6,5,12,7]*VT[19,18,20,21]*HT[10,15,16,11]*HT[14,13,22,15]*rhoDenominator[12,11,19,13]
+    @tensor EnergyDenominator[] := T[17,3,4,1]*T[4,9,10,5]*T[24,2,8,3]*T[8,7,14,9]*T[16,23,17,18]*T[22,21,24,23]*
+                        VT[20,1,6,2]*VT[6,5,12,7]*VT[19,18,20,21]*HT[10,15,16,11]*HT[14,13,22,15]*rhoDenominator[12,11,19,13]
+    append!(InternalEnergyTree,[EnergyNumerator[1]/EnergyDenominator[1]])
+
+    internalenergyexact = ComputeInternalEnergy(Beta)
+    append!(InternalEnergyExact,[internalenergyexact])
+end
